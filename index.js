@@ -1,462 +1,332 @@
-// index.js — TonyOS backend (industry-grade single-file version)
+// index.js – TonyOS backend with Google Login
 
 require("dotenv").config();
 const express = require("express");
 const cors = require("cors");
-const helmet = require("helmet");
-const morgan = require("morgan");
-const rateLimit = require("express-rate-limit");
-const { Pool } = require("pg");
+const session = require("express-session");
+const passport = require("passport");
+const GoogleStrategy = require("passport-google-oauth20").Strategy;
+const path = require("path");
 const { OpenAI } = require("openai");
+const Database = require("better-sqlite3");
 
-// ---------- BASIC APP SETUP ----------
-
+// ==== BASIC SERVER SETUP ====
 const app = express();
+app.use(express.json());
+app.use(cors({ origin: true, credentials: true }));
 
-// Important for Render / other proxies so rate-limit + IPs work correctly
+// Trust proxy for Render / HTTPS cookies
 app.set("trust proxy", 1);
 
-app.use(express.json());
+// ==== SESSION + PASSPORT SETUP ====
 app.use(
-  cors({
-    origin: "*", // you can lock this down later to your Vercel origin
+  session({
+    secret: process.env.SESSION_SECRET || "dev_secret_change_me",
+    resave: false,
+    saveUninitialized: false,
+    cookie: {
+      httpOnly: true,
+      secure: process.env.NODE_ENV === "production",
+      maxAge: 1000 * 60 * 60 * 24 * 7, // 7 days
+    },
   })
 );
-app.use(helmet());
-app.use(morgan("tiny"));
 
-const limiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute window
-  max: 100,            // 100 requests / minute per IP
-  standardHeaders: true,
-  legacyHeaders: false,
-  skipFailedRequests: true, // fixes ERR_ERL_UNEXPECTED_X_FORWARDED_FOR weirdness
-});
-app.use(limiter);
+app.use(passport.initialize());
+app.use(passport.session());
 
-// ---------- CONFIG & CLIENTS ----------
+// ==== OPENAI CLIENT (if you use it elsewhere) ====
+const client = new OpenAI({ apiKey: process.env.OPENAI_API_KEY });
 
-const PORT = process.env.PORT || 10000;
+// ==== SQLITE SETUP ====
+const db = new Database("tasks.db");
 
-if (!process.env.DATABASE_URL) {
-  console.warn("⚠️  DATABASE_URL is not set. Backend will crash on DB usage.");
-}
-if (!process.env.OPENAI_API_KEY) {
-  console.warn("⚠️  OPENAI_API_KEY is not set. /chat and /brain-dump will fail.");
-}
-
-const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
-  ssl: { rejectUnauthorized: false }, // Render PostgreSQL requires TLS
-});
-
-const openai = new OpenAI({
-  apiKey: process.env.OPENAI_API_KEY,
-});
-
-// ---------- DB INIT ----------
-
-async function initDb() {
-  const ddl = `
-    CREATE TABLE IF NOT EXISTS tasks (
-      id              SERIAL PRIMARY KEY,
-      title           TEXT        NOT NULL,
-      description     TEXT,
-      area            TEXT,
-      status          TEXT        NOT NULL DEFAULT 'open',   -- open | doing | scheduled | done
-      bucket          TEXT        NOT NULL DEFAULT 'later',  -- today | this_week | later
-      priority        INTEGER     NOT NULL DEFAULT 3,        -- 1 = highest
-
-      leverage_score  INTEGER,
-      urgency_score   INTEGER,
-      risk_score      INTEGER,
-      friction_score  INTEGER,
-
-      due_date        TIMESTAMPTZ,
-      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-  `;
-  await pool.query(ddl);
-  console.log("✅ Postgres initialized (TonyOS schema ready)");
-}
-
-// Small helper to keep updated_at correct
-async function touchUpdatedAt(id) {
-  await pool.query(`UPDATE tasks SET updated_at = NOW() WHERE id = $1`, [id]);
-}
-
-// ---------- SCORING ENGINE (SAME LOGIC AS FRONTEND) ----------
-
-function urgencyScore(task) {
-  const { due_date: due, bucket } = task;
-  if (!due) {
-    if (bucket === "today") return 3;
-    if (bucket === "this_week") return 2;
-    return 1;
-  }
-  const now = new Date();
-  const d = new Date(due);
-  if (Number.isNaN(d.getTime())) return 1;
-  const diffMs = d.getTime() - now.getTime();
-  const diffHours = diffMs / (1000 * 60 * 60);
-
-  if (diffHours < 0) return 5;
-  if (diffHours <= 24) return 4;
-  if (diffHours <= 72) return 3;
-  if (diffHours <= 24 * 7) return 2;
-  return 1;
-}
-
-function leverageScore(task) {
-  const p =
-    typeof task.priority === "number"
-      ? task.priority
-      : parseInt(task.priority || "3", 10);
-  const clamped = Math.min(Math.max(p || 3, 1), 5);
-  return 6 - clamped; // priority 1 → 5 leverage … priority 5 → 1
-}
-
-function riskScore(task) {
-  const u = urgencyScore(task);
-  if (u >= 4) return 4;
-  if (u === 3) return 3;
-  return 2;
-}
-
-function frictionScore(task) {
-  const desc = (task.description || "").toLowerCase();
-  if (!desc) return 2;
-  if (
-    desc.includes("tax") ||
-    desc.includes("accounting") ||
-    desc.includes("legal")
+// Users table
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS users (
+    id         INTEGER PRIMARY KEY AUTOINCREMENT,
+    google_id  TEXT UNIQUE,
+    email      TEXT,
+    name       TEXT,
+    avatar     TEXT,
+    created_at TEXT NOT NULL
   )
-    return 3;
-  if (desc.includes("call") || desc.includes("email")) return 1;
-  return 2;
+`).run();
+
+// Tasks table (now includes user_id)
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS tasks (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    title       TEXT    NOT NULL,
+    description TEXT,
+    area        TEXT,
+    status      TEXT    NOT NULL DEFAULT 'todo',      -- todo | doing | scheduled | done
+    bucket      TEXT    NOT NULL DEFAULT 'later',     -- today | this_week | later | backlog
+    priority    INTEGER NOT NULL DEFAULT 3,           -- 1 = highest
+    due_date    TEXT,                                 -- ISO string or null
+    created_at  TEXT    NOT NULL,
+    updated_at  TEXT    NOT NULL,
+    user_id     INTEGER
+  )
+`).run();
+
+// ==== USER HELPERS ====
+const findUserById = db.prepare("SELECT * FROM users WHERE id = ?");
+const findUserByGoogleId = db.prepare("SELECT * FROM users WHERE google_id = ?");
+const insertUser = db.prepare(`
+  INSERT INTO users (google_id, email, name, avatar, created_at)
+  VALUES (?, ?, ?, ?, ?)
+`);
+
+// ==== PASSPORT GOOGLE STRATEGY ====
+passport.serializeUser((user, done) => {
+  done(null, user.id);
+});
+
+passport.deserializeUser((id, done) => {
+  try {
+    const user = findUserById.get(id);
+    done(null, user || false);
+  } catch (err) {
+    done(err);
+  }
+});
+
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL:
+        process.env.GOOGLE_CALLBACK_URL ||
+        "http://localhost:3000/auth/google/callback",
+    },
+    (accessToken, refreshToken, profile, done) => {
+      try {
+        const googleId = profile.id;
+        const email = profile.emails?.[0]?.value || null;
+        const name = profile.displayName || null;
+        const avatar = profile.photos?.[0]?.value || null;
+
+        let user = findUserByGoogleId.get(googleId);
+        if (!user) {
+          const info = insertUser.run(
+            googleId,
+            email,
+            name,
+            avatar,
+            new Date().toISOString()
+          );
+          user = findUserById.get(info.lastInsertRowid);
+        }
+        return done(null, user);
+      } catch (err) {
+        return done(err);
+      }
+    }
+  )
+);
+
+// ==== AUTH MIDDLEWARE ====
+function ensureAuth(req, res, next) {
+  if (req.isAuthenticated && req.isAuthenticated()) return next();
+  return res.status(401).json({ error: "Unauthorized" });
 }
 
-function computeScores(task) {
-  const L = leverageScore(task);
-  const U = urgencyScore(task);
-  const R = riskScore(task);
-  const F = frictionScore(task);
-  return { L, U, R, F, score: L + U + R - F };
-}
+// ==== STATIC FILES (dashboard.html + login.html sitting next to this file) ====
+app.use(express.static(__dirname));
 
-// ---------- SIMPLE HEALTH ENDPOINTS ----------
-
+// Root route – send to login or dashboard depending on auth
 app.get("/", (req, res) => {
-  res.json({
-    ok: true,
-    service: "tonyos-backend",
-    message: "TonyOS backend API",
+  if (req.isAuthenticated && req.isAuthenticated()) {
+    return res.redirect("/dashboard.html");
+  }
+  return res.redirect("/login.html");
+});
+
+// ==== GOOGLE AUTH ROUTES ====
+
+// Start Google OAuth flow
+app.get(
+  "/auth/google",
+  passport.authenticate("google", { scope: ["profile", "email"] })
+);
+
+// Google callback
+app.get(
+  "/auth/google/callback",
+  passport.authenticate("google", { failureRedirect: "/login.html" }),
+  (req, res) => {
+    // Successful auth –> go to TonyOS
+    res.redirect("/dashboard.html");
+  }
+);
+
+// Get current user
+app.get("/api/me", (req, res) => {
+  if (!req.isAuthenticated || !req.isAuthenticated()) {
+    return res.status(200).json({ user: null });
+  }
+  const { id, email, name, avatar } = req.user;
+  res.json({ user: { id, email, name, avatar } });
+});
+
+// Logout
+app.get("/logout", (req, res, next) => {
+  req.logout(err => {
+    if (err) return next(err);
+    req.session.destroy(() => {
+      res.clearCookie("connect.sid");
+      res.redirect("/login.html");
+    });
   });
 });
 
-app.get("/health", (req, res) => {
-  res.json({ status: "ok" });
+// ==== TASKS CRUD (per-user) ====
+
+// List tasks for this user
+const listTasksStmt = db.prepare(`
+  SELECT * FROM tasks
+  WHERE user_id = ?
+  ORDER BY
+    CASE bucket
+      WHEN 'today' THEN 1
+      WHEN 'this_week' THEN 2
+      WHEN 'later' THEN 3
+      ELSE 4
+    END,
+    priority ASC,
+    created_at DESC
+`);
+
+// Insert task
+const insertTaskStmt = db.prepare(`
+  INSERT INTO tasks (
+    title, description, area, status, bucket,
+    priority, due_date, created_at, updated_at, user_id
+  )
+  VALUES (
+    @title, @description, @area, @status, @bucket,
+    @priority, @due_date, @created_at, @updated_at, @user_id
+  )
+`);
+
+// Update task
+const updateTaskStmt = db.prepare(`
+  UPDATE tasks
+  SET
+    title       = @title,
+    description = @description,
+    area        = @area,
+    status      = @status,
+    bucket      = @bucket,
+    priority    = @priority,
+    due_date    = @due_date,
+    updated_at  = @updated_at
+  WHERE id = @id AND user_id = @user_id
+`);
+
+// Delete task
+const deleteTaskStmt = db.prepare(`
+  DELETE FROM tasks WHERE id = ? AND user_id = ?
+`);
+
+// GET /api/tasks – list tasks for logged-in user
+app.get("/api/tasks", ensureAuth, (req, res) => {
+  const tasks = listTasksStmt.all(req.user.id);
+  res.json({ tasks });
 });
 
-// ---------- TASK ENDPOINTS ----------
+// POST /api/tasks – create task for logged-in user
+app.post("/api/tasks", ensureAuth, (req, res) => {
+  const now = new Date().toISOString();
+  const {
+    title,
+    description = "",
+    area = "",
+    status = "todo",
+    bucket = "later",
+    priority = 3,
+    due_date = null,
+  } = req.body || {};
 
-// GET /tasks  → list all tasks
-app.get("/tasks", async (req, res, next) => {
-  try {
-    const { rows } = await pool.query(
-      `SELECT * FROM tasks ORDER BY created_at ASC;`
-    );
-    res.json(rows);
-  } catch (err) {
-    next(err);
+  if (!title || typeof title !== "string") {
+    return res.status(400).json({ error: "title is required" });
   }
+
+  const info = insertTaskStmt.run({
+    title,
+    description,
+    area,
+    status,
+    bucket,
+    priority,
+    due_date,
+    created_at: now,
+    updated_at: now,
+    user_id: req.user.id,
+  });
+
+  const task = db
+    .prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?")
+    .get(info.lastInsertRowid, req.user.id);
+
+  res.status(201).json({ task });
 });
 
-// POST /tasks  → create single task
-app.post("/tasks", async (req, res, next) => {
-  try {
-    const {
-      title,
-      description = null,
-      area = null,
-      status = "open",
-      bucket = "later",
-      priority = 3,
-      due_date = null,
-    } = req.body || {};
+// PUT /api/tasks/:id – update existing task
+app.put("/api/tasks/:id", ensureAuth, (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ error: "invalid id" });
 
-    if (!title || typeof title !== "string") {
-      return res.status(400).json({ error: "title is required" });
-    }
+  const existing = db
+    .prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?")
+    .get(id, req.user.id);
+  if (!existing) return res.status(404).json({ error: "not found" });
 
-    const scores = computeScores({ title, description, bucket, priority, due_date });
+  const {
+    title = existing.title,
+    description = existing.description,
+    area = existing.area,
+    status = existing.status,
+    bucket = existing.bucket,
+    priority = existing.priority,
+    due_date = existing.due_date,
+  } = req.body || {};
 
-    const insert = `
-      INSERT INTO tasks
-        (title, description, area, status, bucket, priority,
-         leverage_score, urgency_score, risk_score, friction_score, due_date)
-      VALUES
-        ($1,   $2,          $3,   $4,    $5,     $6,
-         $7,             $8,           $9,         $10,            $11)
-      RETURNING *;
-    `;
-    const params = [
-      title,
-      description,
-      area,
-      status,
-      bucket,
-      priority,
-      scores.L,
-      scores.U,
-      scores.R,
-      scores.F,
-      due_date,
-    ];
+  updateTaskStmt.run({
+    id,
+    title,
+    description,
+    area,
+    status,
+    bucket,
+    priority,
+    due_date,
+    updated_at: new Date().toISOString(),
+    user_id: req.user.id,
+  });
 
-    const { rows } = await pool.query(insert, params);
-    res.status(201).json(rows[0]);
-  } catch (err) {
-    next(err);
-  }
+  const updated = db
+    .prepare("SELECT * FROM tasks WHERE id = ? AND user_id = ?")
+    .get(id, req.user.id);
+
+  res.json({ task: updated });
 });
 
-// PATCH /tasks/:id/complete  → mark done
-app.patch("/tasks/:id/complete", async (req, res, next) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) {
-      return res.status(400).json({ error: "invalid id" });
-    }
+// DELETE /api/tasks/:id – delete task
+app.delete("/api/tasks/:id", ensureAuth, (req, res) => {
+  const id = Number(req.params.id);
+  if (!id) return res.status(400).json({ error: "invalid id" });
 
-    const { rows } = await pool.query(
-      `UPDATE tasks
-         SET status = 'done',
-             updated_at = NOW()
-       WHERE id = $1
-       RETURNING *;`,
-      [id]
-    );
-
-    if (!rows.length) {
-      return res.status(404).json({ error: "task not found" });
-    }
-
-    res.json(rows[0]);
-  } catch (err) {
-    next(err);
-  }
+  deleteTaskStmt.run(id, req.user.id);
+  res.status(204).end();
 });
 
-// DELETE /tasks/:id → delete task
-app.delete("/tasks/:id", async (req, res, next) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) {
-      return res.status(400).json({ error: "invalid id" });
-    }
+// ==== (OPTIONAL) AI CHAT ENDPOINTS COULD GO HERE, ALSO PROTECTED BY ensureAuth ====
 
-    const { rowCount } = await pool.query(`DELETE FROM tasks WHERE id = $1`, [
-      id,
-    ]);
-    if (rowCount === 0) {
-      return res.status(404).json({ error: "task not found" });
-    }
-
-    res.status(204).send();
-  } catch (err) {
-    next(err);
-  }
+// ==== START SERVER ====
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`TonyOS backend listening on port ${PORT}`);
 });
-
-// ---------- BRAIN DUMP → TASKS (OPENAI) ----------
-
-// POST /brain-dump  { text, default_bucket, default_area }
-app.post("/brain-dump", async (req, res, next) => {
-  try {
-    const { text, default_bucket = "today", default_area = null } = req.body || {};
-    if (!text || typeof text !== "string") {
-      return res.status(400).json({ error: "text is required" });
-    }
-
-    if (!process.env.OPENAI_API_KEY) {
-      return res
-        .status(500)
-        .json({ error: "OPENAI_API_KEY not configured on backend" });
-    }
-
-    const prompt = `
-You are TonyOS, a task parser.
-User brain dump:
-
-"""${text}"""
-
-Return a strict JSON array (no extra text) where each item is:
-{
-  "title": string,                     // short task name
-  "description": string,               // one line detail
-  "bucket": "today" | "this_week" | "later",
-  "area": string | null,               // e.g. "TM Weddings", "Personal"
-  "priority": 1 | 2 | 3 | 4 | 5,       // 1 = highest
-  "due_date": string | null            // ISO date if obvious, else null
-}
-Only infer due_date when the text clearly implies it; otherwise use null.
-If something is not a clear actionable task, drop it.
-`;
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [{ role: "user", content: prompt }],
-      temperature: 0.2,
-    });
-
-    const raw = completion.choices[0]?.message?.content || "[]";
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch (err) {
-      console.error("Brain dump JSON parse failed, raw:", raw);
-      return res
-        .status(502)
-        .json({ error: "LLM returned invalid JSON", raw });
-    }
-
-    const tasks = Array.isArray(parsed) ? parsed : [];
-    if (!tasks.length) {
-      return res.json({ tasks: [] });
-    }
-
-    const created = [];
-    for (const t of tasks) {
-      const title = String(t.title || "").trim();
-      if (!title) continue;
-
-      const description = t.description ? String(t.description) : null;
-      const area = t.area ? String(t.area) : default_area;
-      const bucket = t.bucket || default_bucket;
-      const priority = Number.isFinite(Number(t.priority))
-        ? Number(t.priority)
-        : 3;
-      const due_date = t.due_date || null;
-
-      const scores = computeScores({
-        title,
-        description,
-        bucket,
-        priority,
-        due_date,
-      });
-
-      const insert = `
-        INSERT INTO tasks
-          (title, description, area, status, bucket, priority,
-           leverage_score, urgency_score, risk_score, friction_score, due_date)
-        VALUES
-          ($1,   $2,          $3,   'open', $4,      $5,
-           $6,             $7,           $8,         $9,            $10)
-        RETURNING *;
-      `;
-
-      const params = [
-        title,
-        description,
-        area,
-        bucket,
-        priority,
-        scores.L,
-        scores.U,
-        scores.R,
-        scores.F,
-        due_date,
-      ];
-
-      const { rows } = await pool.query(insert, params);
-      created.push(rows[0]);
-    }
-
-    res.status(201).json({ tasks: created });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ---------- CHAT GPT ENDPOINT ----------
-
-// POST /chat  { prompt }
-app.post("/chat", async (req, res, next) => {
-  try {
-    const { prompt } = req.body || {};
-    if (!prompt || typeof prompt !== "string") {
-      return res.status(400).json({ error: "prompt is required" });
-    }
-
-    if (!process.env.OPENAI_API_KEY) {
-      return res
-        .status(500)
-        .json({ error: "OPENAI_API_KEY not configured on backend" });
-    }
-
-    // Pull current tasks so ChatGPT can reason over them
-    const { rows: tasks } = await pool.query(
-      `SELECT * FROM tasks ORDER BY created_at ASC;`
-    );
-
-    const systemMsg = `
-You are TonyOS, an execution-focused AI.
-Given Tony's current tasks (with priority, bucket, and leverage/urgency/risk/friction),
-tell him what to do next and why in 2–4 short bullet points and one clear sentence:
-"Start with: …".
-Do NOT invent new tasks, just reason over what's given.
-`;
-
-    const completion = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      messages: [
-        { role: "system", content: systemMsg },
-        {
-          role: "user",
-          content: JSON.stringify(
-            { prompt, tasks },
-            null,
-            2
-          ),
-        },
-      ],
-      temperature: 0.3,
-    });
-
-    const answer = completion.choices[0]?.message?.content?.trim() || "";
-    res.json({ response: answer });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// ---------- 404 + ERROR HANDLERS ----------
-
-app.use((req, res, next) => {
-  res.status(404).json({ error: "Not found", path: req.path });
-});
-
-app.use((err, req, res, next) => {
-  console.error("❌ Backend error:", err);
-  res.status(500).json({ error: "Internal server error" });
-});
-
-// ---------- STARTUP ----------
-
-(async () => {
-  try {
-    await initDb();
-    app.listen(PORT, () => {
-      console.log(
-        `🚀 TonyOS backend running on http://localhost:${PORT}`
-      );
-    });
-  } catch (err) {
-    console.error("Failed to start backend:", err);
-    process.exit(1);
-  }
-})();
-
