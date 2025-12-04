@@ -1,4 +1,4 @@
-// index.js – TonyOS backend (industry-grade single-file version)
+// index.js — TonyOS backend (single-file, industry-style)
 
 require("dotenv").config();
 const express = require("express");
@@ -9,591 +9,456 @@ const rateLimit = require("express-rate-limit");
 const { Pool } = require("pg");
 const { OpenAI } = require("openai");
 
-// -------------------- ENV + CONSTANTS --------------------
-
-const PORT = process.env.PORT || 5000;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const DATABASE_URL = process.env.DATABASE_URL;
-
-if (!OPENAI_API_KEY) {
-  console.warn("⚠️  OPENAI_API_KEY is not set. /chat and /brain-dump will fail.");
-}
-if (!DATABASE_URL) {
-  console.warn("⚠️  DATABASE_URL is not set. Backend will not connect to Postgres.");
-}
-
-// -------------------- APP SETUP --------------------
-
+// ---------- BASIC APP SETUP ----------
 const app = express();
-
-// Security + basics
+app.use(express.json());
+app.use(
+  cors({
+    origin: "*", // you can tighten to your Vercel domain later
+  })
+);
 app.use(helmet());
-app.use(cors({ origin: "*", methods: ["GET", "POST", "PATCH", "DELETE", "OPTIONS"] }));
-app.use(express.json({ limit: "1mb" }));
 app.use(morgan("tiny"));
 
-// Rate limits – protect AI + write-heavy endpoints
-const aiLimiter = rateLimit({
-  windowMs: 60 * 1000, // 1 minute
-  max: 30,
-  standardHeaders: true,
-  legacyHeaders: false,
-});
-app.use("/chat", aiLimiter);
-app.use("/brain-dump", aiLimiter);
-
-const writeLimiter = rateLimit({
+// Small rate-limit to protect backend / OpenAI
+const limiter = rateLimit({
   windowMs: 60 * 1000,
   max: 60,
-  standardHeaders: true,
-  legacyHeaders: false,
 });
-app.use("/tasks", writeLimiter);
+app.use(limiter);
 
-// OpenAI client
-const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
+const client = new OpenAI({
+  apiKey: process.env.OPENAI_API_KEY,
+});
 
-// -------------------- POSTGRES SETUP --------------------
-
+// ---------- POSTGRES SETUP ----------
 const pool = new Pool({
-  connectionString: DATABASE_URL,
-  ssl:
-    process.env.NODE_ENV === "production"
-      ? { rejectUnauthorized: false } // Render / managed Postgres
-      : false,
+  connectionString:
+    process.env.DATABASE_URL ||
+    "postgresql://tonymartinez@localhost:5432/tonyos",
+  ssl: process.env.RENDER
+    ? { rejectUnauthorized: false }
+    : false,
 });
 
-/**
- * Initialize DB schema. Safe to call repeatedly.
- */
 async function initDb() {
   const ddl = `
     CREATE TABLE IF NOT EXISTS tasks (
-      id              SERIAL PRIMARY KEY,
-      title           TEXT NOT NULL,
-      description     TEXT,
-      area            TEXT,
-      status          TEXT NOT NULL DEFAULT 'open',   -- open | doing | scheduled | done
-      bucket          TEXT NOT NULL DEFAULT 'later',  -- today | this_week | later
-      priority        INTEGER NOT NULL DEFAULT 3,     -- 1 highest, 5 lowest
-      leverage_score  INTEGER,
-      urgency_score   INTEGER,
-      risk_score      INTEGER,
-      friction_score  INTEGER,
-      due_date        TIMESTAMPTZ,
-      created_at      TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-      updated_at      TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      id            SERIAL PRIMARY KEY,
+      title         TEXT    NOT NULL,
+      description   TEXT,
+      area          TEXT,
+      status        TEXT    NOT NULL DEFAULT 'open',   -- open | doing | scheduled | done
+      bucket        TEXT    NOT NULL DEFAULT 'later',  -- today | this_week | later
+      priority      INTEGER NOT NULL DEFAULT 3,        -- 1 = highest
+      leverage_score INTEGER,
+      urgency_score  INTEGER,
+      risk_score     INTEGER,
+      friction_score INTEGER,
+      score          INTEGER,
+      due_date      TIMESTAMPTZ,
+      created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+      updated_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
-
-    CREATE INDEX IF NOT EXISTS idx_tasks_bucket ON tasks(bucket);
-    CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
-    CREATE INDEX IF NOT EXISTS idx_tasks_due_date ON tasks(due_date);
   `;
-
   await pool.query(ddl);
   console.log("✅ Postgres initialized (TonyOS schema ready)");
 }
 
-// -------------------- SMALL HELPERS --------------------
-
-function isValidBucket(bucket) {
-  return ["today", "this_week", "later"].includes(bucket);
+// helper: keep updated_at fresh
+async function touchTask(id) {
+  await pool.query(
+    "UPDATE tasks SET updated_at = NOW() WHERE id = $1",
+    [id]
+  );
 }
 
-function clampPriority(p) {
-  if (Number.isNaN(p)) return 3;
-  if (p < 1) return 1;
-  if (p > 5) return 5;
-  return p;
-}
+// ---------- HELPERS ----------
+function computeTonyScore(t) {
+  const bucket = t.bucket || "later";
 
-function validateTaskPayload(body, { partial = false } = {}) {
-  const errors = [];
-
-  if (!partial || body.title !== undefined) {
-    if (!body.title || typeof body.title !== "string" || body.title.trim().length < 3) {
-      errors.push("title must be a non-empty string (min 3 chars).");
+  // urgency based on due_date + bucket
+  function urgencyScore() {
+    if (!t.due_date) {
+      if (bucket === "today") return 3;
+      if (bucket === "this_week") return 2;
+      return 1;
     }
+    const now = new Date();
+    const d = new Date(t.due_date);
+    if (Number.isNaN(d.getTime())) return 1;
+    const diffHours = (d.getTime() - now.getTime()) / (1000 * 60 * 60);
+    if (diffHours < 0) return 5;
+    if (diffHours <= 24) return 4;
+    if (diffHours <= 72) return 3;
+    if (diffHours <= 24 * 7) return 2;
+    return 1;
   }
 
-  if (body.bucket !== undefined && !isValidBucket(body.bucket)) {
-    errors.push("bucket must be one of: today, this_week, later.");
+  function leverageScore() {
+    if (typeof t.leverage_score === "number") return t.leverage_score;
+    const p = typeof t.priority === "number" ? t.priority : 3;
+    const clamped = Math.min(Math.max(p, 1), 5);
+    return 6 - clamped; // P1 => 5, P5 => 1
   }
 
-  if (body.priority !== undefined) {
-    const p = Number(body.priority);
-    if (!Number.isInteger(p) || p < 1 || p > 5) {
-      errors.push("priority must be an integer between 1 and 5.");
-    }
+  function riskScore() {
+    if (typeof t.risk_score === "number") return t.risk_score;
+    const u = urgencyScore();
+    if (u >= 4) return 4;
+    if (u === 3) return 3;
+    return 2;
   }
 
-  if (body.due_date !== undefined && body.due_date !== null && body.due_date !== "") {
-    const d = new Date(body.due_date);
-    if (Number.isNaN(d.getTime())) {
-      errors.push("due_date must be a valid date or omitted.");
-    }
+  function frictionScore() {
+    if (typeof t.friction_score === "number") return t.friction_score;
+    const desc = (t.description || "").toLowerCase();
+    if (!desc) return 2;
+    if (
+      desc.includes("tax") ||
+      desc.includes("accounting") ||
+      desc.includes("legal")
+    )
+      return 3;
+    if (desc.includes("call") || desc.includes("email")) return 1;
+    return 2;
   }
 
-  return errors;
+  const L = leverageScore();
+  const U = urgencyScore();
+  const R = riskScore();
+  const F = frictionScore();
+  const score = L + U + R - F;
+
+  return { L, U, R, F, score };
 }
 
-// TonyOS scoring – same logic front + back (source of truth)
-function computeTonyScore(task) {
-  const now = new Date();
-
-  // Leverage from priority (1 high → 5 low) if not set
-  const leverage =
-    typeof task.leverage_score === "number"
-      ? task.leverage_score
-      : (() => {
-          const p = clampPriority(task.priority ?? 3);
-          return 6 - p; // 1 → 5, 2 → 4, ...
-        })();
-
-  // Urgency (due date + bucket)
-  let urgency = 1;
-  if (task.due_date) {
-    const d = new Date(task.due_date);
-    if (!Number.isNaN(d.getTime())) {
-      const diffHours = (d.getTime() - now.getTime()) / (1000 * 60 * 60);
-      if (diffHours < 0) urgency = 5;
-      else if (diffHours <= 24) urgency = 4;
-      else if (diffHours <= 72) urgency = 3;
-      else if (diffHours <= 24 * 7) urgency = 2;
-      else urgency = 1;
-    }
-  } else if (task.bucket === "today") urgency = 3;
-  else if (task.bucket === "this_week") urgency = 2;
-
-  const risk =
-    typeof task.risk_score === "number"
-      ? task.risk_score
-      : urgency >= 4
-      ? 4
-      : urgency === 3
-      ? 3
-      : 2;
-
-  let friction = 2;
-  if (typeof task.friction_score === "number") friction = task.friction_score;
-  else {
-    const desc = (task.description || "").toLowerCase();
-    if (!desc) friction = 2;
-    else if (desc.includes("tax") || desc.includes("accounting") || desc.includes("legal"))
-      friction = 3;
-    else if (desc.includes("call") || desc.includes("email")) friction = 1;
-    else friction = 2;
-  }
-
-  const score = leverage + urgency + risk - friction;
-
-  return {
-    leverage_score: leverage,
-    urgency_score: urgency,
-    risk_score: risk,
-    friction_score: friction,
-    tony_score: score,
-  };
+// re-score tasks when we fetch them
+function withScores(rows) {
+  return rows.map((t) => {
+    const metrics = computeTonyScore(t);
+    return { ...t, ...metrics };
+  });
 }
 
-// Normalize a raw DB row into the JSON shape the frontend already expects
-function mapTaskRow(row) {
-  const scores = computeTonyScore(row);
-  return {
-    id: row.id,
-    title: row.title,
-    description: row.description,
-    area: row.area,
-    status: row.status,
-    bucket: row.bucket,
-    priority: row.priority,
-    due_date: row.due_date,
-    created_at: row.created_at,
-    updated_at: row.updated_at,
-    leverage_score: scores.leverage_score,
-    urgency_score: scores.urgency_score,
-    risk_score: scores.risk_score,
-    friction_score: scores.friction_score,
-    score: scores.tony_score,
-  };
-}
+// ---------- ROUTES ----------
 
-// -------------------- ROUTES: HEALTH --------------------
-
-app.get("/health", async (req, res, next) => {
+// Healthcheck
+app.get("/health", async (req, res) => {
   try {
     await pool.query("SELECT 1");
-    res.json({
-      status: "ok",
-      uptime: process.uptime(),
-      timestamp: new Date().toISOString(),
-    });
+    res.json({ ok: true });
   } catch (err) {
-    next(err);
+    console.error("Healthcheck error", err);
+    res.status(500).json({ ok: false });
   }
 });
 
-// -------------------- ROUTES: TASKS --------------------
-
-// GET /tasks – list all tasks
-app.get("/tasks", async (req, res, next) => {
+// GET /tasks  – main feed for dashboard
+app.get("/tasks", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT *
-       FROM tasks
-       ORDER BY
-         status = 'done',
-         bucket,
-         priority,
-         COALESCE(due_date, '9999-12-31'::timestamptz),
-         created_at`
+      `
+      SELECT
+        id, title, description, area, status, bucket, priority,
+        leverage_score, urgency_score, risk_score, friction_score, score,
+        due_date, created_at, updated_at
+      FROM tasks
+      ORDER BY
+        (status = 'done') ASC,
+        bucket,
+        priority,
+        COALESCE(due_date, '9999-12-31') ASC
+      `
     );
-    const tasks = result.rows.map(mapTaskRow);
-    res.json(tasks);
+    res.json(withScores(result.rows));
   } catch (err) {
-    next(err);
+    console.error("GET /tasks error", err);
+    res.status(500).json({ error: "Failed to load tasks" });
   }
 });
 
-// POST /tasks – create a new task
-app.post("/tasks", async (req, res, next) => {
+// POST /tasks  – quick add
+app.post("/tasks", async (req, res) => {
   try {
-    const body = req.body || {};
-    const errors = validateTaskPayload(body, { partial: false });
-    if (errors.length) {
-      return res.status(400).json({ error: "Invalid task payload", details: errors });
+    const {
+      title,
+      description = null,
+      area = null,
+      bucket = "later",
+      status = "open",
+      priority = 3,
+      due_date = null,
+    } = req.body || {};
+
+    if (!title || typeof title !== "string") {
+      return res.status(400).json({ error: "title is required" });
     }
 
-    const title = body.title.trim();
-    const description = body.description ? String(body.description).trim() : null;
-    const area = body.area ? String(body.area).trim() : null;
-    const bucket = isValidBucket(body.bucket) ? body.bucket : "later";
-    const priority = clampPriority(Number(body.priority ?? 3));
-    const dueDate =
-      body.due_date && body.due_date !== ""
-        ? new Date(body.due_date).toISOString()
-        : null;
+    const insert = `
+      INSERT INTO tasks
+        (title, description, area, status, bucket, priority, due_date)
+      VALUES
+        ($1, $2, $3, $4, $5, $6, $7)
+      RETURNING
+        id, title, description, area, status, bucket, priority,
+        leverage_score, urgency_score, risk_score, friction_score, score,
+        due_date, created_at, updated_at
+    `;
 
-    const scoreObj = computeTonyScore({
+    const result = await pool.query(insert, [
       title,
       description,
       area,
+      status,
       bucket,
       priority,
-      due_date: dueDate,
+      due_date,
+    ]);
+
+    const [row] = withScores(result.rows);
+    res.status(201).json(row);
+  } catch (err) {
+    console.error("POST /tasks error", err);
+    res.status(500).json({ error: "Failed to create task" });
+  }
+});
+
+// PATCH /tasks/:id/complete
+app.patch("/tasks/:id/complete", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "Invalid id" });
+    }
+
+    const result = await pool.query(
+      `
+      UPDATE tasks
+      SET status = 'done',
+          updated_at = NOW()
+      WHERE id = $1
+      RETURNING
+        id, title, description, area, status, bucket, priority,
+        leverage_score, urgency_score, risk_score, friction_score, score,
+        due_date, created_at, updated_at
+      `,
+      [id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Task not found" });
+    }
+
+    const [row] = withScores(result.rows);
+    res.json(row);
+  } catch (err) {
+    console.error("PATCH /tasks/:id/complete error", err);
+    res.status(500).json({ error: "Failed to complete task" });
+  }
+});
+
+// DELETE /tasks/:id
+app.delete("/tasks/:id", async (req, res) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id)) {
+      return res.status(400).json({ error: "Invalid id" });
+    }
+
+    const result = await pool.query("DELETE FROM tasks WHERE id = $1", [id]);
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "Task not found" });
+    }
+
+    res.json({ ok: true });
+  } catch (err) {
+    console.error("DELETE /tasks/:id error", err);
+    res.status(500).json({ error: "Failed to delete task" });
+  }
+});
+
+// POST /brain-dump  – use OpenAI to turn text into tasks
+app.post("/brain-dump", async (req, res) => {
+  try {
+    const { text, default_bucket = "today", default_area = null } = req.body || {};
+
+    if (!text || typeof text !== "string") {
+      return res.status(400).json({ error: "text is required" });
+    }
+
+    const completion = await client.chat.completions.create({
+      model: "gpt-4.1-mini",
+      messages: [
+        {
+          role: "system",
+          content:
+            "You are TonyOS, an AI that converts a messy brain dump into a concise list of actionable tasks for a task manager. " +
+            "Return ONLY valid JSON.Each task must have: title (string), description (string), bucket (today|this_week|later), " +
+            "priority (1-5, 1 = most important), due_date (ISO date string or null), area (string or null).",
+        },
+        {
+          role: "user",
+          content: `Brain dump:\n${text}\n\nDefault bucket: ${default_bucket}\nDefault area: ${
+            default_area || "null"
+          }.`,
+        },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: {
+          name: "tasks_payload",
+          schema: {
+            type: "object",
+            properties: {
+              tasks: {
+                type: "array",
+                items: {
+                  type: "object",
+                  properties: {
+                    title: { type: "string" },
+                    description: { type: "string" },
+                    bucket: { type: "string" },
+                    priority: { type: "integer" },
+                    due_date: { type: ["string", "null"] },
+                    area: { type: ["string", "null"] },
+                  },
+                  required: ["title"],
+                  additionalProperties: false,
+                },
+              },
+            },
+            required: ["tasks"],
+            additionalProperties: false,
+          },
+        },
+      },
     });
 
-    const result = await pool.query(
-      `INSERT INTO tasks
-        (title, description, area, status, bucket, priority,
-         leverage_score, urgency_score, risk_score, friction_score,
-         due_date, created_at, updated_at)
-       VALUES
-        ($1, $2, $3, 'open', $4, $5,
-         $6, $7, $8, $9,
-         $10, NOW(), NOW())
-       RETURNING *`,
-      [
+    const parsed = JSON.parse(
+      completion.choices[0].message.content || '{"tasks":[]}'
+    );
+    const tasks = Array.isArray(parsed.tasks) ? parsed.tasks : [];
+
+    const created = [];
+
+    for (const t of tasks) {
+      const {
         title,
-        description,
-        area,
-        bucket,
-        priority,
-        scoreObj.leverage_score,
-        scoreObj.urgency_score,
-        scoreObj.risk_score,
-        scoreObj.friction_score,
-        dueDate,
-      ]
-    );
+        description = null,
+        bucket = default_bucket,
+        priority = 3,
+        due_date = null,
+        area = default_area || null,
+      } = t;
 
-    const task = mapTaskRow(result.rows[0]);
-    res.status(201).json(task);
+      if (!title) continue;
+
+      const result = await pool.query(
+        `
+        INSERT INTO tasks
+          (title, description, area, status, bucket, priority, due_date)
+        VALUES
+          ($1, $2, $3, 'open', $4, $5, $6)
+        RETURNING
+          id, title, description, area, status, bucket, priority,
+          leverage_score, urgency_score, risk_score, friction_score, score,
+          due_date, created_at, updated_at
+        `,
+        [title, description, area, bucket, priority, due_date]
+      );
+
+      created.push(withScores(result.rows)[0]);
+    }
+
+    res.json({ tasks: created });
   } catch (err) {
-    next(err);
+    console.error("POST /brain-dump error", err);
+    res.status(500).json({ error: "Failed to parse brain dump" });
   }
 });
 
-// PATCH /tasks/:id/complete – mark as done
-app.patch("/tasks/:id/complete", async (req, res, next) => {
+// POST /chat  – THIS is the upgraded TonyOS brain
+app.post("/chat", async (req, res) => {
   try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) {
-      return res.status(400).json({ error: "Invalid task id" });
-    }
-
-    const result = await pool.query(
-      `UPDATE tasks
-       SET status = 'done',
-           updated_at = NOW()
-       WHERE id = $1
-       RETURNING *`,
-      [id]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Task not found" });
-    }
-
-    const task = mapTaskRow(result.rows[0]);
-    res.json(task);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// DELETE /tasks/:id – delete a task
-app.delete("/tasks/:id", async (req, res, next) => {
-  try {
-    const id = Number(req.params.id);
-    if (!Number.isInteger(id)) {
-      return res.status(400).json({ error: "Invalid task id" });
-    }
-
-    const result = await pool.query(
-      `DELETE FROM tasks
-       WHERE id = $1
-       RETURNING *`,
-      [id]
-    );
-
-    if (result.rowCount === 0) {
-      return res.status(404).json({ error: "Task not found" });
-    }
-
-    res.status(204).send(); // No content
-  } catch (err) {
-    next(err);
-  }
-});
-
-// -------------------- ROUTES: CHAT --------------------
-
-app.post("/chat", async (req, res, next) => {
-  try {
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY not configured" });
-    }
-
-    const prompt = (req.body && req.body.prompt) || "";
-    if (!prompt.trim()) {
+    const { prompt } = req.body || {};
+    if (!prompt || typeof prompt !== "string") {
       return res.status(400).json({ error: "prompt is required" });
     }
 
-    // Pull recent tasks as context (limit to 40 to keep tokens sane)
+    // Load current tasks
     const result = await pool.query(
-      `SELECT *
-       FROM tasks
-       ORDER BY created_at DESC
-       LIMIT 40`
+      `
+      SELECT
+        id, title, description, area, status, bucket, priority,
+        leverage_score, urgency_score, risk_score, friction_score, score,
+        due_date, created_at, updated_at
+      FROM tasks
+      ORDER BY
+        (status = 'done') ASC,
+        bucket,
+        priority,
+        COALESCE(due_date, '9999-12-31') ASC
+      `
     );
-    const tasks = result.rows.map(mapTaskRow);
+    const tasks = withScores(result.rows);
 
-    const systemPrompt = `
-You are TonyOS, an AI priority engine for Tony Ellis Martinez.
-You see his current task list and must give concise, actionable guidance.
-
-Rules:
-- Speak clearly and directly.
-- Focus on leverage, urgency, and risk.
-- Return a short answer (1–3 tight paragraphs or bullet lists).
-    `.trim();
-
-    const response = await openai.chat.completions.create({
+    const completion = await client.chat.completions.create({
       model: "gpt-4.1-mini",
       messages: [
-        { role: "system", content: systemPrompt },
+        {
+          role: "system",
+          content:
+            "You are TonyOS, Tony Ellis Martinez's AI Command Board. " +
+            "You ALWAYS think like a ruthless operator and prioritization engine. " +
+            "You are given Tony's current task list (with leverage/urgency/risk/friction scores). " +
+            "Use ONLY that task list to answer questions about what he should do, in what order, and why. " +
+            "If he asks for the 'most important' or 'next' thing, choose 1–3 tasks and justify them briefly. " +
+            "Be blunt, clear, and practical.",
+        },
+        {
+          role: "system",
+          content:
+            "Current tasks JSON:\n" +
+            JSON.stringify(tasks, null, 2),
+        },
         {
           role: "user",
-          content: JSON.stringify({
-            prompt,
-            tasks,
-          }),
+          content: prompt,
         },
       ],
     });
 
-    const text = response.choices[0]?.message?.content?.trim() || "";
-    res.json({ response: text });
-  } catch (err) {
-    next(err);
-  }
-});
+    const answer =
+      completion.choices[0]?.message?.content?.trim() ||
+      "No response from model.";
 
-// -------------------- ROUTES: BRAIN DUMP → TASKS --------------------
-
-app.post("/brain-dump", async (req, res, next) => {
-  try {
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ error: "OPENAI_API_KEY not configured" });
-    }
-
-    const text = (req.body && req.body.text) || "";
-    const defaultBucket = isValidBucket(req.body?.default_bucket)
-      ? req.body.default_bucket
-      : "today";
-    const defaultArea =
-      req.body && req.body.default_area && String(req.body.default_area).trim()
-        ? String(req.body.default_area).trim()
-        : null;
-
-    if (!text.trim()) {
-      return res.status(400).json({ error: "text is required" });
-    }
-    if (text.length > 4000) {
-      return res.status(400).json({ error: "text too long (max 4000 chars)" });
-    }
-
-    const prompt = `
-You are TonyOS, an AI that converts a messy brain dump into clear tasks.
-
-Return STRICT JSON with this exact shape:
-
-{
-  "tasks": [
-    {
-      "title": "string, required",
-      "description": "string, optional",
-      "bucket": "today | this_week | later, optional",
-      "priority": "1-5, integer, optional (1 highest)",
-      "area": "string, optional",
-      "due_date": "YYYY-MM-DD or null, optional"
-    }
-  ]
-}
-
-Rules:
-- Only include tasks that are concrete actions (not vague reflections).
-- If bucket is missing, use "${defaultBucket}".
-- If area is missing, use "${defaultArea || "General"}".
-- If you are unsure about dates, set due_date to null.
-    `.trim();
-
-    const response = await openai.chat.completions.create({
-      model: "gpt-4.1-mini",
-      response_format: { type: "json_object" },
-      messages: [
-        { role: "system", content: prompt },
-        { role: "user", content: text },
-      ],
+    res.json({
+      response: answer,
+      task_count: tasks.length,
     });
-
-    const raw = response.choices[0]?.message?.content || "{}";
-    let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      return res.status(500).json({
-        error: "Failed to parse AI response",
-        raw,
-      });
-    }
-
-    const tasksArr = Array.isArray(parsed.tasks) ? parsed.tasks : [];
-    if (!tasksArr.length) {
-      return res.json({ tasks: [] });
-    }
-
-    const client = await pool.connect();
-    try {
-      await client.query("BEGIN");
-      const created = [];
-
-      for (const t of tasksArr) {
-        const title = (t.title || "").trim();
-        if (!title) continue;
-
-        const bucket = isValidBucket(t.bucket) ? t.bucket : defaultBucket;
-        const priority = clampPriority(Number(t.priority ?? 3));
-        const area =
-          (t.area && String(t.area).trim()) || defaultArea || "General";
-        const description =
-          t.description && String(t.description).trim().length
-            ? String(t.description).trim()
-            : null;
-        const dueDate =
-          t.due_date && String(t.due_date).trim()
-            ? new Date(t.due_date).toISOString()
-            : null;
-
-        const scores = computeTonyScore({
-          title,
-          description,
-          area,
-          bucket,
-          priority,
-          due_date: dueDate,
-        });
-
-        const result = await client.query(
-          `INSERT INTO tasks
-            (title, description, area, status, bucket, priority,
-             leverage_score, urgency_score, risk_score, friction_score,
-             due_date, created_at, updated_at)
-           VALUES
-            ($1, $2, $3, 'open', $4, $5,
-             $6, $7, $8, $9,
-             $10, NOW(), NOW())
-           RETURNING *`,
-          [
-            title,
-            description,
-            area,
-            bucket,
-            priority,
-            scores.leverage_score,
-            scores.urgency_score,
-            scores.risk_score,
-            scores.friction_score,
-            dueDate,
-          ]
-        );
-
-        created.push(mapTaskRow(result.rows[0]));
-      }
-
-      await client.query("COMMIT");
-      res.status(201).json({ tasks: created });
-    } catch (err) {
-      await client.query("ROLLBACK");
-      throw err;
-    } finally {
-      client.release();
-    }
   } catch (err) {
-    next(err);
+    console.error("POST /chat error", err);
+    res.status(500).json({ error: "Chat failed" });
   }
 });
 
-// -------------------- 404 + ERROR HANDLERS --------------------
-
-// 404 handler
+// fallback
 app.use((req, res) => {
-  res.status(404).json({ error: "Not found", path: req.originalUrl });
+  res.status(404).json({ error: "Not found", path: req.path });
 });
 
-// Global error handler
-app.use((err, req, res, _next) => {
-  console.error("❌ Unhandled error:", err);
-  res.status(500).json({
-    error: "Internal server error",
-    message:
-      process.env.NODE_ENV === "production"
-        ? "Something went wrong."
-        : err.message,
-  });
-});
+// ---------- STARTUP ----------
+const PORT = process.env.PORT || 10000;
 
-// -------------------- START SERVER --------------------
-
-(async () => {
-  try {
-    await initDb();
+initDb()
+  .then(() => {
     app.listen(PORT, () => {
-      console.log(`✅ TonyOS backend running on http://localhost:${PORT}`);
+      console.log(`🚀 TonyOS backend running on http://localhost:${PORT}`);
     });
-  } catch (err) {
-    console.error("❌ Failed to init TonyOS backend", err);
+  })
+  .catch((err) => {
+    console.error("Failed to init DB", err);
     process.exit(1);
-  }
-})();
+  });
